@@ -1,0 +1,26 @@
+# VoyagerGPT Backend Configuration Example
+# These environment variables can be set in your deployment
+
+# Port to run the API on (default: 8080)
+# Cloud Run will automatically set this
+PORT=8080
+
+# Model path (relative to api.py)
+MODEL_PATH=./voyagerModel.pth
+
+# CORS origins (comma-separated list of allowed origins)
+# Use "*" for development, specify your Streamlit URL for production
+CORS_ORIGINS=*
+
+# Log level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+LOG_LEVEL=INFO
+
+# Optional: Force CPU or GPU (if available)
+DEVICE=cpu
+
+# Cloud Run automatically sets these environment variables:
+# - PORT: The port to listen on
+# - K_SERVICE: Service name
+# - K_REVISION: Revision name
+# - K_CONFIGURATION: Configuration name
+
