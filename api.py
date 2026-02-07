@@ -135,8 +135,18 @@ async def generate_text(request: GenerateRequest):
         
         # Prepare context
         if request.context and len(request.context) > 0:
-            # Truncate context to BLOCK_SIZE if necessary (model can only handle BLOCK_SIZE tokens)
+            # Check if context contains strings (characters) or integers (token IDs)
             context_tokens = request.context
+            
+            # If context contains strings, we need to encode them to token IDs
+            if isinstance(context_tokens[0], str):
+                logger.info(f"Context contains strings, encoding to token IDs")
+                # Join the characters back into a string and encode
+                context_text = ''.join(context_tokens)
+                context_tokens = encode(context_text)
+                logger.info(f"Encoded {len(context_text)} characters to {len(context_tokens)} tokens")
+            
+            # Truncate context to BLOCK_SIZE if necessary (model can only handle BLOCK_SIZE tokens)
             if len(context_tokens) > BLOCK_SIZE:
                 logger.warning(f"Context length ({len(context_tokens)}) exceeds BLOCK_SIZE ({BLOCK_SIZE}). Truncating to last {BLOCK_SIZE} tokens.")
                 context_tokens = context_tokens[-BLOCK_SIZE:]
