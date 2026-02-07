@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional
 import logging
+import json
 
 from model import GPTLanguageModel, encode, decode, BLOCK_SIZE
 
@@ -118,16 +119,35 @@ async def generate_text(request: GenerateRequest):
         import time
         start_time = time.time()
         
+        # Log the incoming request with truncated context for readability
+        request_dict = request.model_dump()
+        log_dict = request_dict.copy()
+        if request.context and len(request.context) > 20:
+            log_dict['context'] = f"[{len(request.context)} tokens - showing first 10 and last 10]"
+            log_dict['context_preview'] = {
+                'first': request.context[:10],
+                'last': request.context[-10:]
+            }
+        logger.info(f"Generation request received: {json.dumps(log_dict)}")
+        
         # Set random seed
         torch.manual_seed(request.seed)
         
         # Prepare context
         if request.context and len(request.context) > 0:
-            # Use provided context
-            context = torch.tensor([request.context], dtype=torch.long, device=device)
+            # Truncate context to BLOCK_SIZE if necessary (model can only handle BLOCK_SIZE tokens)
+            context_tokens = request.context
+            if len(context_tokens) > BLOCK_SIZE:
+                logger.warning(f"Context length ({len(context_tokens)}) exceeds BLOCK_SIZE ({BLOCK_SIZE}). Truncating to last {BLOCK_SIZE} tokens.")
+                context_tokens = context_tokens[-BLOCK_SIZE:]
+            
+            # Use provided context (already a list, so wrap it as a batch of 1)
+            context = torch.tensor(context_tokens, dtype=torch.long, device=device).unsqueeze(0)
+            logger.info(f"Using context with {len(context_tokens)} tokens")
         else:
             # Start with zero token
             context = torch.zeros((1, 1), dtype=torch.long, device=device)
+            logger.info("Starting with zero token context")
         
         # Generate text
         with torch.no_grad():
@@ -151,7 +171,28 @@ async def generate_text(request: GenerateRequest):
         )
     
     except Exception as e:
-        logger.error(f"Generation failed: {str(e)}")
+        # Prepare error logging with truncated context
+        error_context = {
+            "seed": request.seed,
+            "temperature": request.temperature,
+            "max_tokens": request.max_tokens,
+            "context_length": len(request.context) if request.context else 0
+        }
+        if request.context and len(request.context) > 0:
+            if len(request.context) <= 20:
+                error_context["context"] = request.context
+            else:
+                error_context["context_preview"] = {
+                    "first_10": request.context[:10],
+                    "last_10": request.context[-10:],
+                    "total_length": len(request.context)
+                }
+        
+        logger.error(
+            f"Generation failed: {str(e)}", 
+            exc_info=True,
+            extra={"request_info": json.dumps(error_context)}
+        )
         raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
 
 
