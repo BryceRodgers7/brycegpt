@@ -15,10 +15,17 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application code and model
+# Copy application code
 COPY model.py .
 COPY api.py .
-COPY voyagerModel.pth .
+
+# Copy models
+COPY models/voyagerModel.pth models/
+COPY models/shakespeareModel.pth models/
+
+# Copy training data (needed for vocabulary extraction)
+COPY training/voyager_dense.txt training/
+COPY training/shakespeare.txt training/
 
 # Expose port (Cloud Run will set PORT env variable)
 EXPOSE 8080
