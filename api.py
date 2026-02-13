@@ -1,6 +1,6 @@
 """
 VoyagerGPT Backend API
-FastAPI service for text generation using the VoyagerGPT model
+FastAPI service for text generation using multiple GPT models
 """
 
 import os
@@ -8,11 +8,13 @@ import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Literal
 import logging
 import json
+import threading
+from dataclasses import dataclass
 
-from model import GPTLanguageModel, encode, decode, BLOCK_SIZE
+from model import GPTLanguageModel, BLOCK_SIZE
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -20,9 +22,9 @@ logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="VoyagerGPT API",
-    description="A bigram GPT built from scratch for Star Trek text generation",
-    version="1.0.0"
+    title="BryceGPT API",
+    description="Multi-model GPT service for text generation",
+    version="2.0.0"
 )
 
 # Add CORS middleware to allow requests from Streamlit frontend
@@ -34,16 +36,126 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Global model variable
-model = None
 device = 'cpu'
 
-# Model path
-MODEL_PATH = os.path.join(os.path.dirname(__file__), 'voyagerModel.pth')
+
+@dataclass
+class ModelConfig:
+    """Configuration for a model including its vocabulary"""
+    name: str
+    model_path: str
+    training_data_path: str
+    chars: list = None
+    stoi: dict = None
+    itos: dict = None
+    vocab_size: int = 0
+    
+    def __post_init__(self):
+        """Load vocabulary from training data"""
+        if self.chars is None:
+            self._load_vocabulary()
+    
+    def _load_vocabulary(self):
+        """Extract vocabulary from training data file"""
+        logger.info(f"Loading vocabulary for {self.name} from {self.training_data_path}")
+        with open(self.training_data_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        
+        # Extract unique characters and sort them
+        self.chars = sorted(list(set(text)))
+        self.vocab_size = len(self.chars)
+        
+        # Create character <-> integer mappings
+        self.stoi = {ch: i for i, ch in enumerate(self.chars)}
+        self.itos = {i: ch for i, ch in enumerate(self.chars)}
+        
+        logger.info(f"Loaded vocabulary for {self.name}: {self.vocab_size} characters")
+    
+    def encode(self, s: str) -> list:
+        """Encode string to list of integers"""
+        return [self.stoi[c] for c in s]
+    
+    def decode(self, l: list) -> str:
+        """Decode list of integers to string"""
+        return ''.join([self.itos[i] for i in l])
+
+
+# Model configurations
+MODEL_CONFIGS = {
+    "voyager": ModelConfig(
+        name="voyager",
+        model_path=os.path.join(os.path.dirname(__file__), 'models', 'voyagerModel.pth'),
+        training_data_path=os.path.join(os.path.dirname(__file__), 'training', 'voyager_dense.txt')
+    ),
+    "shakespeare": ModelConfig(
+        name="shakespeare",
+        model_path=os.path.join(os.path.dirname(__file__), 'models', 'shakespeareModel.pth'),
+        training_data_path=os.path.join(os.path.dirname(__file__), 'training', 'shakespeare.txt')
+    )
+}
+
+
+class ModelCache:
+    """Thread-safe lazy-loading model cache"""
+    
+    def __init__(self):
+        self._models = {}
+        self._locks = {name: threading.Lock() for name in MODEL_CONFIGS.keys()}
+        self._global_lock = threading.Lock()
+    
+    def get_model(self, model_name: str) -> tuple[GPTLanguageModel, ModelConfig]:
+        """
+        Get a model from cache or load it if not cached.
+        Thread-safe: concurrent requests for the same model will only load once.
+        
+        Returns:
+            tuple: (model, config)
+        """
+        if model_name not in MODEL_CONFIGS:
+            raise ValueError(f"Unknown model: {model_name}. Available: {list(MODEL_CONFIGS.keys())}")
+        
+        # Fast path: model already loaded
+        if model_name in self._models:
+            return self._models[model_name], MODEL_CONFIGS[model_name]
+        
+        # Slow path: need to load model (with lock to prevent duplicate loading)
+        with self._locks[model_name]:
+            # Double-check after acquiring lock (another thread might have loaded it)
+            if model_name in self._models:
+                return self._models[model_name], MODEL_CONFIGS[model_name]
+            
+            # Load the model
+            config = MODEL_CONFIGS[model_name]
+            logger.info(f"Loading model '{model_name}' from {config.model_path}")
+            
+            model = GPTLanguageModel(vocab_size=config.vocab_size)
+            model.load_state_dict(
+                torch.load(config.model_path, map_location=torch.device(device), weights_only=True)
+            )
+            model.eval()
+            
+            # Cache the model
+            self._models[model_name] = model
+            
+            logger.info(f"Model '{model_name}' loaded successfully on {device}")
+            return model, config
+    
+    def is_loaded(self, model_name: str) -> bool:
+        """Check if a model is currently loaded in cache"""
+        return model_name in self._models
+    
+    def get_loaded_models(self) -> list:
+        """Get list of currently loaded model names"""
+        return list(self._models.keys())
+
+
+# Global model cache
+model_cache = ModelCache()
 
 
 class GenerateRequest(BaseModel):
     """Request model for text generation"""
+    model: Literal["voyager", "shakespeare"] = Field(description="Model to use for generation")
     seed: int = Field(default=1337, description="Random seed for reproducibility")
     temperature: float = Field(default=0.1, ge=0.01, le=2.0, description="Temperature for sampling (0.01-2.0)")
     max_tokens: int = Field(default=100, ge=1, le=500, description="Maximum number of tokens to generate")
@@ -52,6 +164,7 @@ class GenerateRequest(BaseModel):
 
 class GenerateResponse(BaseModel):
     """Response model for text generation"""
+    model: str = Field(description="Model used for generation")
     text: str = Field(description="Generated text")
     tokens: list = Field(description="Token indices of the generated text")
     generation_time: float = Field(description="Time taken to generate text in seconds")
@@ -60,33 +173,18 @@ class GenerateResponse(BaseModel):
 class HealthResponse(BaseModel):
     """Health check response"""
     status: str
-    model_loaded: bool
+    available_models: list
+    loaded_models: list
     device: str
-
-
-@app.on_event("startup")
-async def load_model():
-    """Load the model on startup"""
-    global model
-    try:
-        logger.info(f"Loading model from {MODEL_PATH}")
-        model = GPTLanguageModel()
-        model.load_state_dict(
-            torch.load(MODEL_PATH, map_location=torch.device(device), weights_only=True)
-        )
-        model.eval()
-        logger.info(f"Model loaded successfully on {device}")
-    except Exception as e:
-        logger.error(f"Failed to load model: {str(e)}")
-        raise
 
 
 @app.get("/", response_model=dict)
 async def root():
     """Root endpoint"""
     return {
-        "message": "VoyagerGPT API",
-        "version": "1.0.0",
+        "message": "BryceGPT API - Multi-Model Text Generation",
+        "version": "2.0.0",
+        "available_models": list(MODEL_CONFIGS.keys()),
         "docs": "/docs"
     }
 
@@ -95,8 +193,9 @@ async def root():
 async def health():
     """Health check endpoint"""
     return HealthResponse(
-        status="healthy" if model is not None else "unhealthy",
-        model_loaded=model is not None,
+        status="healthy",
+        available_models=list(MODEL_CONFIGS.keys()),
+        loaded_models=model_cache.get_loaded_models(),
         device=device
     )
 
@@ -104,17 +203,14 @@ async def health():
 @app.post("/generate", response_model=GenerateResponse)
 async def generate_text(request: GenerateRequest):
     """
-    Generate text using VoyagerGPT
+    Generate text using specified GPT model
     
     Args:
-        request: GenerateRequest with seed, temperature, max_tokens, and optional context
+        request: GenerateRequest with model name, seed, temperature, max_tokens, and optional context
     
     Returns:
         GenerateResponse with generated text, tokens, and generation time
     """
-    if model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
     try:
         import time
         start_time = time.time()
@@ -130,6 +226,12 @@ async def generate_text(request: GenerateRequest):
             }
         logger.info(f"Generation request received: {json.dumps(log_dict)}")
         
+        # Load model (lazy-loaded, thread-safe)
+        try:
+            model, config = model_cache.get_model(request.model)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        
         # Set random seed
         torch.manual_seed(request.seed)
         
@@ -143,7 +245,7 @@ async def generate_text(request: GenerateRequest):
                 logger.info(f"Context contains strings, encoding to token IDs")
                 # Join the characters back into a string and encode
                 context_text = ''.join(context_tokens)
-                context_tokens = encode(context_text)
+                context_tokens = config.encode(context_text)
                 logger.info(f"Encoded {len(context_text)} characters to {len(context_tokens)} tokens")
             
             # Truncate context to BLOCK_SIZE if necessary (model can only handle BLOCK_SIZE tokens)
@@ -167,22 +269,26 @@ async def generate_text(request: GenerateRequest):
                 temperature=request.temperature
             )[0].tolist()
         
-        # Decode tokens to text
-        text = decode(generated)
+        # Decode tokens to text using model-specific decoder
+        text = config.decode(generated)
         
         generation_time = time.time() - start_time
         
-        logger.info(f"Generated {len(generated)} tokens in {generation_time:.2f}s")
+        logger.info(f"Generated {len(generated)} tokens in {generation_time:.2f}s using model '{request.model}'")
         
         return GenerateResponse(
+            model=request.model,
             text=text,
             tokens=generated,
             generation_time=generation_time
         )
     
+    except HTTPException:
+        raise
     except Exception as e:
         # Prepare error logging with truncated context
         error_context = {
+            "model": request.model,
             "seed": request.seed,
             "temperature": request.temperature,
             "max_tokens": request.max_tokens,
@@ -206,14 +312,39 @@ async def generate_text(request: GenerateRequest):
         raise HTTPException(status_code=500, detail=f"Generation failed: {str(e)}")
 
 
-@app.get("/vocab", response_model=dict)
-async def get_vocabulary():
-    """Get the model's vocabulary"""
-    from model import CHARS, VOCAB_SIZE
+@app.get("/vocab/{model_name}", response_model=dict)
+async def get_vocabulary(model_name: str):
+    """Get vocabulary for a specific model"""
+    if model_name not in MODEL_CONFIGS:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Model '{model_name}' not found. Available: {list(MODEL_CONFIGS.keys())}"
+        )
+    
+    config = MODEL_CONFIGS[model_name]
     return {
-        "vocab_size": VOCAB_SIZE,
-        "characters": CHARS,
+        "model": model_name,
+        "vocab_size": config.vocab_size,
+        "characters": config.chars,
         "block_size": BLOCK_SIZE
+    }
+
+
+@app.get("/models", response_model=dict)
+async def list_models():
+    """List all available models and their status"""
+    models_info = {}
+    for name, config in MODEL_CONFIGS.items():
+        models_info[name] = {
+            "name": name,
+            "vocab_size": config.vocab_size,
+            "loaded": model_cache.is_loaded(name),
+            "model_path": config.model_path,
+            "training_data": config.training_data_path
+        }
+    return {
+        "models": models_info,
+        "loaded_models": model_cache.get_loaded_models()
     }
 
 
