@@ -43,33 +43,61 @@ def apply_temperature(logits, temperature):
 
 
 class Head(nn.Module):
-    """One head of self-attention"""
+    """One head of self-attention with KV-cache support"""
 
     def __init__(self, head_size):
         super().__init__()
         self.key = nn.Linear(N_EMBD, head_size, bias=False)
         self.query = nn.Linear(N_EMBD, head_size, bias=False)
         self.value = nn.Linear(N_EMBD, head_size, bias=False)
+        # Kept for compatibility with existing checkpoints; not used in forward.
         self.register_buffer('tril', torch.tril(torch.ones(BLOCK_SIZE, BLOCK_SIZE)))
         self.dropout = nn.Dropout(DROPOUT)
 
-    def forward(self, x):
+    def forward(self, x, past_kv=None):
+        """
+        Args:
+            x:        (B, T, C) – new input tokens only (T=1 during incremental decoding)
+            past_kv:  optional tuple (past_k, past_v) each (B, T_past, hs)
+        Returns:
+            out:        (B, T, hs)
+            present_kv: tuple (k, v) each (B, T_past+T, hs) – full updated cache
+        """
         B, T, C = x.shape
-        k = self.key(x)   # (B,T,hs)
-        q = self.query(x)  # (B,T,hs)
-        # Compute attention scores ("affinities")
-        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5  # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))  # (B, T, T)
-        wei = F.softmax(wei, dim=-1)  # (B, T, T)
+        k = self.key(x)    # (B, T, hs)
+        q = self.query(x)  # (B, T, hs)
+        v = self.value(x)  # (B, T, hs)
+
+        # Prepend cached keys/values from previous steps
+        if past_kv is not None:
+            past_k, past_v = past_kv
+            k = torch.cat([past_k, k], dim=1)  # (B, T_past+T, hs)
+            v = torch.cat([past_v, v], dim=1)  # (B, T_past+T, hs)
+
+        present_kv = (k, v)  # will be returned as the new cache
+
+        T_total = k.shape[1]          # T_past + T
+        T_past  = T_total - T
+
+        # Compute attention scores
+        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5  # (B, T, T_total)
+
+        # Dynamic causal mask: query at absolute position (T_past+i) may only
+        # attend to keys at absolute positions 0 … T_past+i.
+        q_pos = torch.arange(T_past, T_past + T, device=x.device).unsqueeze(1)  # (T, 1)
+        k_pos = torch.arange(T_total,             device=x.device).unsqueeze(0)  # (1, T_total)
+        wei = wei.masked_fill((k_pos > q_pos).unsqueeze(0), float('-inf'))       # (B, T, T_total)
+
+        wei = F.softmax(wei, dim=-1)  # (B, T, T_total)
         wei = self.dropout(wei)
-        # Perform weighted aggregation of values
-        v = self.value(x)  # (B,T,hs)
-        out = wei @ v  # (B, T, T) @ (B, T, hs) -> (B, T, hs)
-        return out
+
+        # Weighted aggregation of values
+        out = wei @ v  # (B, T, hs)
+        return out, present_kv
 
 
 class MultiHeadAttention(nn.Module):
-    """Multiple heads of self-attention in parallel"""
+    """Multiple heads of self-attention in parallel with KV-cache support"""
 
     def __init__(self, num_heads, head_size):
         super().__init__()
@@ -77,10 +105,27 @@ class MultiHeadAttention(nn.Module):
         self.proj = nn.Linear(head_size * num_heads, N_EMBD)
         self.dropout = nn.Dropout(DROPOUT)
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
+    def forward(self, x, past_kvs=None):
+        """
+        Args:
+            x:         (B, T, C)
+            past_kvs:  list of (past_k, past_v) per head, or None
+        Returns:
+            out:          (B, T, C)
+            present_kvs:  list of (k, v) per head
+        """
+        if past_kvs is None:
+            past_kvs = [None] * len(self.heads)
+
+        head_outs, present_kvs = [], []
+        for head, past_kv in zip(self.heads, past_kvs):
+            h_out, present_kv = head(x, past_kv)
+            head_outs.append(h_out)
+            present_kvs.append(present_kv)
+
+        out = torch.cat(head_outs, dim=-1)
         out = self.dropout(self.proj(out))
-        return out
+        return out, present_kvs
 
 
 class FeedForward(nn.Module):
@@ -100,7 +145,7 @@ class FeedForward(nn.Module):
 
 
 class Block(nn.Module):
-    """Transformer block: communication followed by computation"""
+    """Transformer block: communication followed by computation, with KV-cache support"""
 
     def __init__(self, n_embd, n_head):
         super().__init__()
@@ -110,10 +155,19 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
+    def forward(self, x, past_kvs=None):
+        """
+        Args:
+            x:         (B, T, C)
+            past_kvs:  list of (past_k, past_v) per head, or None
+        Returns:
+            x:            (B, T, C)
+            present_kvs:  list of (k, v) per head
+        """
+        sa_out, present_kvs = self.sa(self.ln1(x), past_kvs)
+        x = x + sa_out
         x = x + self.ffwd(self.ln2(x))
-        return x
+        return x, present_kvs
 
 
 class GPTLanguageModel(nn.Module):
@@ -122,12 +176,16 @@ class GPTLanguageModel(nn.Module):
     def __init__(self, vocab_size=VOCAB_SIZE, n_embd=N_EMBD, block_size=BLOCK_SIZE, n_head=N_HEAD, n_layer=N_LAYER):
         super().__init__()
         self.block_size = block_size
+        self.n_layer = n_layer
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        # ModuleList (vs Sequential) so we can pass per-layer KV caches explicitly.
+        # State-dict keys are identical ("blocks.0.*", "blocks.1.*", …) so existing
+        # checkpoints load without modification.
+        self.blocks = nn.ModuleList([Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
-        
+
         # Initialize weights
         self.apply(self._init_weights)
 
@@ -139,44 +197,97 @@ class GPTLanguageModel(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, past_kvs=None):
+        """
+        Args:
+            idx:       (B, T) token indices.  T=1 during incremental decoding.
+            targets:   (B, T) target indices for training loss, or None.
+            past_kvs:  list[list[(k, v)]] – per-layer, per-head KV caches, or None.
+        Returns:
+            logits:       (B, T, vocab_size)  — or (B*T, vocab_size) when targets given
+            loss:         scalar or None
+            present_kvs:  updated list[list[(k, v)]] for all layers
+        """
         device = idx.device
         B, T = idx.shape
 
-        tok_emb = self.token_embedding_table(idx)  # (B,T,C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device))  # (T,C)
-        x = tok_emb + pos_emb  # (B,T,C)
-        x = self.blocks(x)  # (B,T,C)
-        x = self.ln_f(x)  # (B,T,C)
-        logits = self.lm_head(x)  # (B,T,vocab_size)
+        # Compute position offset from the cache so embeddings stay consistent
+        # across prefill and incremental steps.
+        T_past = 0
+        if past_kvs is not None and past_kvs[0] is not None:
+            # past_kvs[layer][head] = (k, v);  k.shape = (B, T_past, hs)
+            T_past = past_kvs[0][0][0].shape[1]
 
-        if targets is None:
-            loss = None
-        else:
+        tok_emb = self.token_embedding_table(idx)                                     # (B, T, C)
+        pos     = torch.arange(T_past, T_past + T, device=device)
+        pos_emb = self.position_embedding_table(pos)                                  # (T, C)
+        x = tok_emb + pos_emb                                                         # (B, T, C)
+
+        if past_kvs is None:
+            past_kvs = [None] * self.n_layer
+
+        present_kvs = []
+        for block, block_past_kvs in zip(self.blocks, past_kvs):
+            x, block_present_kvs = block(x, block_past_kvs)
+            present_kvs.append(block_present_kvs)
+
+        x      = self.ln_f(x)                   # (B, T, C)
+        logits = self.lm_head(x)                # (B, T, vocab_size)
+
+        loss = None
+        if targets is not None:
             B, T, C = logits.shape
-            logits = logits.view(B*T, C)
-            targets = targets.view(B*T)
-            loss = F.cross_entropy(logits, targets)
+            logits  = logits.view(B * T, C)
+            targets = targets.view(B * T)
+            loss    = F.cross_entropy(logits, targets)
 
-        return logits, loss
-    
+        return logits, loss, present_kvs
+
     def generate(self, idx, max_new_tokens, temperature=1.0):
-        """Generate new tokens given a context"""
-        device = idx.device
+        """
+        Autoregressive token generation with KV-caching.
+
+        Strategy
+        --------
+        • First call  – "prefill": run the full current context through the model
+          and store the resulting KV cache.
+        • Subsequent calls – "incremental": feed only the single new token; the
+          cached K/V tensors supply the history, making each step O(T) instead of
+          O(T²) in attention computation.
+        • Cache overflow – when the cached sequence reaches block_size the next
+          incremental position would be out-of-range for the position embedding
+          table.  In that case we fall back to a full recompute on the last
+          block_size tokens (identical to the original behaviour) and discard
+          the resulting cache so the pattern can repeat.
+        """
+        past_kvs = None
+
         for _ in range(max_new_tokens):
-            # Crop idx to the last block_size tokens
-            idx_cond = idx[:, -self.block_size:]
-            # Get predictions
-            logits, loss = self(idx_cond)
-            # Focus only on the last time step
-            logits = logits[:, -1, :]  # becomes (B, C)
-            # Apply temperature
-            logits = apply_temperature(logits, temperature)
-            # Apply softmax to get probabilities
-            probs = F.softmax(logits, dim=-1)  # (B, C)
-            # Sample from the distribution
-            idx_next = torch.multinomial(probs, num_samples=1)  # (B, 1)
-            # Append sampled index to the running sequence
-            idx = torch.cat((idx, idx_next), dim=1)  # (B, T+1)
+            # Current length of the KV cache (0 if no cache yet)
+            T_past = past_kvs[0][0][0].shape[1] if past_kvs is not None else 0
+
+            if T_past >= self.block_size:
+                # ── Cache full: full recompute, then discard cache ──────────
+                idx_cond          = idx[:, -self.block_size:]
+                logits, _, _      = self(idx_cond)
+                past_kvs          = None              # reset; next step re-prefills
+
+            elif past_kvs is None:
+                # ── Prefill: first step, process the entire context ─────────
+                idx_cond          = idx[:, -self.block_size:]
+                logits, _, past_kvs = self(idx_cond)
+
+            else:
+                # ── Incremental: only the single newest token ───────────────
+                idx_cond          = idx[:, -1:]
+                logits, _, past_kvs = self(idx_cond, past_kvs=past_kvs)
+
+            # Sample the next token from the last position's logits
+            logits   = logits[:, -1, :]                        # (B, C)
+            logits   = apply_temperature(logits, temperature)
+            probs    = F.softmax(logits, dim=-1)               # (B, C)
+            idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
+            idx      = torch.cat((idx, idx_next), dim=1)       # (B, T+1)
+
         return idx
 
