@@ -52,3 +52,8 @@ Thumbs.db
 # Logs
 *.log
 
+# terraform
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+crash.log

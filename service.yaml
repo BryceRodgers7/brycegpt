@@ -1,0 +1,57 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  annotations:
+    run.googleapis.com/ingress: all
+    run.googleapis.com/ingress-status: all
+    run.googleapis.com/invoker-iam-disabled: 'true'
+    run.googleapis.com/maxScale: '1'
+    run.googleapis.com/urls: '["https://brycegpt-804669074450.us-central1.run.app","https://brycegpt-wicdpwebgq-uc.a.run.app"]'
+  labels:
+    cloud.googleapis.com/location: us-central1
+    commit-sha: 2c67d35e12d952d9e9f522d9801eb39f28018526
+    gcb-build-id: a40ffe66-de0c-49d5-819d-cd0dcdbe109e
+    gcb-trigger-id: de7cfad4-3d08-46ab-ba00-d7883ec70c79
+    gcb-trigger-region: global
+    managed-by: gcp-cloud-build-deploy-cloud-run
+  name: brycegpt
+  namespace: '804669074450'
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/maxScale: '20'
+        autoscaling.knative.dev/minScale: '1'
+        run.googleapis.com/client-name: cloud-console
+        run.googleapis.com/startup-cpu-boost: 'true'
+      labels:
+        client.knative.dev/nonce: 1ae5086f-6ac5-49dc-a7cd-759de2c1aea0
+        commit-sha: 2c67d35e12d952d9e9f522d9801eb39f28018526
+        gcb-build-id: a40ffe66-de0c-49d5-819d-cd0dcdbe109e
+        gcb-trigger-id: de7cfad4-3d08-46ab-ba00-d7883ec70c79
+        gcb-trigger-region: global
+        managed-by: gcp-cloud-build-deploy-cloud-run
+        run.googleapis.com/startupProbeType: Default
+    spec:
+      containerConcurrency: 1
+      containers:
+      - image: us-central1-docker.pkg.dev/stoked-monitor-375412/cloud-run-source-deploy/brycegpt/brycegpt:2c67d35e12d952d9e9f522d9801eb39f28018526
+        name: placeholder-1
+        ports:
+        - containerPort: 8080
+          name: http1
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+        startupProbe:
+          failureThreshold: 1
+          periodSeconds: 240
+          tcpSocket:
+            port: 8080
+          timeoutSeconds: 240
+      serviceAccountName: 804669074450-compute@developer.gserviceaccount.com
+      timeoutSeconds: 300
+  traffic:
+  - latestRevision: true
+    percent: 100
