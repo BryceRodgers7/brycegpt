@@ -1,0 +1,13 @@
+# k8s/overlays/gke/patch-deployment-gke.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpt-api
+spec:
+  replicas: 2
+  template:
+    spec:
+      containers:
+        - name: gpt-api
+          image: us-central1-docker.pkg.dev/stoked-monitor-375412/ml-apps/bryce-gpt-api:prod
+          imagePullPolicy: IfNotPresent

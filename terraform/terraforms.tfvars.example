@@ -1,0 +1,16 @@
+project_id            = "stoked-monitor-375412"
+region                = "us-central1"
+service_name          = "brycegpt"
+container_image       = "us-central1-docker.pkg.dev/stoked-monitor-375412/cloud-run-source-deploy/brycegpt/brycegpt:2c67d35e12d952d9e9f522d9801eb39f28018526"
+service_account_email = "804669074450-compute@developer.gserviceaccount.com"
+
+min_instance_count    = 1
+max_instance_count    = 20
+container_concurrency = 1
+timeout               = "300s"
+container_port        = 8080
+cpu_limit             = "1"
+memory_limit          = "1Gi"
+
+deletion_protection   = true
+allow_public_access   = true

@@ -1,0 +1,15 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gpt-api
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+        - name: gpt-api
+          image: brycegpt-api:local
+          imagePullPolicy: Never
+          env:
+            - name: GOOGLE_CLOUD_PROJECT
+              value: "stoked-monitor-375412"
